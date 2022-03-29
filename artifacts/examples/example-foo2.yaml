@@ -4,6 +4,7 @@ metadata:
   name: example-foo
   labels:
     test.test.io/key: primaryOne
+    test.test.io/secondKey: primaryTwo
 spec:
   deploymentName: example-foo
   replicas: 1

@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -46,6 +47,9 @@ import (
 
 const controllerAgentName = "sample-controller"
 
+// Deployment Indexer for use in demonstrating errors
+const fooIndex = "test.test.io/fooCriteria"
+
 const (
 	// SuccessSynced is used as part of the Event 'reason' when a Foo is synced
 	SuccessSynced = "Synced"
@@ -70,6 +74,7 @@ type Controller struct {
 
 	deploymentsLister appslisters.DeploymentLister
 	deploymentsSynced cache.InformerSynced
+	foosIndexer       cache.Indexer
 	foosLister        listers.FooLister
 	foosSynced        cache.InformerSynced
 
@@ -100,12 +105,21 @@ func NewController(
 	eventBroadcaster.StartStructuredLogging(0)
 	eventBroadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: kubeclientset.CoreV1().Events("")})
 	recorder := eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: controllerAgentName})
+	fooIndexers := map[string]cache.IndexFunc{
+		fooIndex: fooBySpecialLabel,
+	}
+
+	err := fooInformer.Informer().AddIndexers(fooIndexers)
+	if err != nil {
+		klog.Errorf("Failed to add indexer, %s", err.Error())
+	}
 
 	controller := &Controller{
 		kubeclientset:     kubeclientset,
 		sampleclientset:   sampleclientset,
 		deploymentsLister: deploymentInformer.Lister(),
 		deploymentsSynced: deploymentInformer.Informer().HasSynced,
+		foosIndexer:       fooInformer.Informer().GetIndexer(),
 		foosLister:        fooInformer.Lister(),
 		foosSynced:        fooInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Foos"),
@@ -182,6 +196,21 @@ func (c *Controller) runWorker() {
 	}
 }
 
+func fooBySpecialLabel(obj interface{}) ([]string, error) {
+	foo, ok := obj.(*samplev1alpha1.Foo)
+	if !ok {
+		return []string{}, nil
+	}
+	validValues := make([]string, 0)
+	for key, value := range foo.Labels {
+		// arbitrary way for me to control which labels are by the indexer
+		if strings.HasPrefix(key, "test.test.io") {
+			validValues = append(validValues, value)
+		}
+	}
+	return validValues, nil
+}
+
 // processNextWorkItem will read a single work item off the workqueue and
 // attempt to process it, by calling the syncHandler.
 func (c *Controller) processNextWorkItem() bool {
@@ -237,6 +266,20 @@ func (c *Controller) processNextWorkItem() bool {
 	return true
 }
 
+func (c *Controller) canFetchFooByLabel(labelValue string) bool {
+	// if we get an object and can confirm that it is a foo, then we are good
+	objs, err := c.foosIndexer.ByIndex(fooIndex, labelValue)
+	if err != nil {
+		klog.Errorf("Error retrieving indexed value %s", err.Error())
+		return false
+	}
+	if len(objs) == 0 {
+		return false
+	}
+	_, ok := objs[0].(*samplev1alpha1.Foo)
+	return ok
+}
+
 // syncHandler compares the actual state with the desired, and attempts to
 // converge the two. It then updates the Status block of the Foo resource
 // with the current status of the resource.
@@ -260,62 +303,21 @@ func (c *Controller) syncHandler(key string) error {
 
 		return err
 	}
-
-	deploymentName := foo.Spec.DeploymentName
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
-		return nil
+	var findErr error
+	for labelKey, labelValue := range foo.Labels {
+		if strings.HasPrefix(labelKey, "test.test.io") {
+			canFetchFoo := c.canFetchFooByLabel(labelValue)
+			klog.Infof("Result of indexer for foo %s, key %s, %t", foo.Name, labelKey, canFetchFoo)
+			if !canFetchFoo {
+				if findErr == nil {
+					findErr = fmt.Errorf("unable to retrieve foo from indexer %s, %s, %s", foo.Name, labelKey, labelValue)
+				} else {
+					findErr = fmt.Errorf("%s, unable to retrieve foo from indexer %s, %s, %s", findErr.Error(), foo.Name, labelKey, labelValue)
+				}
+			}
+		}
 	}
-
-	// Get the deployment with the name specified in Foo.spec
-	deployment, err := c.deploymentsLister.Deployments(foo.Namespace).Get(deploymentName)
-	// If the resource doesn't exist, we'll create it
-	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Create(context.TODO(), newDeployment(foo), metav1.CreateOptions{})
-	}
-
-	// If an error occurs during Get/Create, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// If the Deployment is not controlled by this Foo resource, we should log
-	// a warning to the event recorder and return error msg.
-	if !metav1.IsControlledBy(deployment, foo) {
-		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
-		c.recorder.Event(foo, corev1.EventTypeWarning, ErrResourceExists, msg)
-		return fmt.Errorf("%s", msg)
-	}
-
-	// If this number of the replicas on the Foo resource is specified, and the
-	// number does not equal the current desired replicas on the Deployment, we
-	// should update the Deployment resource.
-	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
-		klog.V(4).Infof("Foo %s replicas: %d, deployment replicas: %d", name, *foo.Spec.Replicas, *deployment.Spec.Replicas)
-		deployment, err = c.kubeclientset.AppsV1().Deployments(foo.Namespace).Update(context.TODO(), newDeployment(foo), metav1.UpdateOptions{})
-	}
-
-	// If an error occurs during Update, we'll requeue the item so we can
-	// attempt processing again later. This could have been caused by a
-	// temporary network failure, or any other transient reason.
-	if err != nil {
-		return err
-	}
-
-	// Finally, we update the status block of the Foo resource to reflect the
-	// current state of the world
-	err = c.updateFooStatus(foo, deployment)
-	if err != nil {
-		return err
-	}
-
-	c.recorder.Event(foo, corev1.EventTypeNormal, SuccessSynced, MessageResourceSynced)
-	return nil
+	return findErr
 }
 
 func (c *Controller) updateFooStatus(foo *samplev1alpha1.Foo, deployment *appsv1.Deployment) error {
